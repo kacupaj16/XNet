@@ -7,6 +7,9 @@ import signal
 import shutil
 import importlib.util
 import time
+import math
+import cv2
+
 
 from keras.preprocessing.image import ImageDataGenerator, array_to_img, img_to_array, load_img
 from keras.models import Model, Sequential, load_model
@@ -16,23 +19,126 @@ from keras import losses
 from keras.optimizers import *
 from keras.callbacks import ModelCheckpoint, LearningRateScheduler, CSVLogger, TensorBoard, EarlyStopping
 from keras.metrics import categorical_accuracy
-from utils import shuffle_together_simple, random_crop
-from random import randint
+from random import randint, shuffle, uniform
 import imgaug as ia
-from keras.utils import to_categorical
-#import matplotlib
+from tensorflow.keras.utils import to_categorical
+import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from imgaug import augmenters as iaa
 from imgaug import parameters as iap
+from sklearn.utils.extmath import cartesian
 
-def fancy_loss(y_true,y_pred):
-    "This function has been written in tensorflow, needs some little changes to work with keras"    
-    y_pred = tf.reshape(y_pred,[-1,y_pred.shape[-1]])
-    y_true = tf.argmax(y_true, axis=-1)
-    y_true = tf.reshape(y_true,[-1])
-    return lovasz_softmax_flat(y_pred, y_true)
+#def fancy_loss(y_true,y_pred):
+#    "This function has been written in tensorflow, needs some little changes to work with keras"    
+#    y_pred = tf.reshape(y_pred,[-1,y_pred.shape[-1]])
+#    y_true = tf.argmax(y_true, axis=-1)
+#    y_true = tf.reshape(y_true,[-1])
+#    return z_softmax_flat(y_pred, y_true)
 
+
+def shuffle_together_simple(images, labels, bodyparts):
+
+    c = list(zip(images,labels, bodyparts))
+    shuffle(c)
+    images, labels, bodyparts = zip(*c)    
+    images = np.asarray(images)
+    labels = np.asarray(labels)
+    bodyparts = np.asarray(bodyparts)
+    
+    return images, labels, bodyparts
+
+def random_crop(x, y, permin, permax):
+    h, w, _ = x.shape
+    per_h = uniform(permin, permax)
+    per_w = uniform(permin, permax)
+    crop_size = (int((1-per_h)*h),int((1-per_w)*w))
+
+    rangew = (w - crop_size[0]) // 2 if w>crop_size[0] else 0
+    rangeh = (h - crop_size[1]) // 2 if h>crop_size[1] else 0
+    offsetw = 0 if rangew == 0 else np.random.randint(rangew)
+    offseth = 0 if rangeh == 0 else np.random.randint(rangeh)
+    cropped_x = x[offseth:offseth+crop_size[0], offsetw:offsetw+crop_size[1], :]
+    cropped_y = y[offseth:offseth+crop_size[0], offsetw:offsetw+crop_size[1], :]
+    resize_x = cv2.resize(cropped_x, (h, w), interpolation=cv2.INTER_CUBIC)
+    resize_y = cv2.resize(cropped_y, (h, w), interpolation=cv2.INTER_NEAREST)
+    if cropped_y.shape[-1] == 0:
+        return x, y
+    else:
+        return np.reshape(resize_x,(h,w,1)), resize_y
+
+
+def dice_coef(y_true, y_pred):
+    smooth=1
+    y_true_f = K.flatten(y_true)
+    y_pred_f = K.flatten(y_pred)
+    intersection = K.sum(y_true_f * y_pred_f)
+    return (2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth)
+
+
+def dice_coef_loss(y_true, y_pred):
+    return -dice_coef(y_true, y_pred)
+
+
+### code fror Hausdorff disntance from https://github.com/danielenricocahall/Keras-Weighted-Hausdorff-Distance-Loss/blob/master/hausdorff/hausdorff.py
+def cdist(A, B):
+    """
+    Computes the pairwise Euclidean distance matrix between two tensorflow matrices A & B, similiar to scikit-learn cdist.
+    For example:
+    A = [[1, 2],
+         [3, 4]]
+    B = [[1, 2],
+         [3, 4]]
+    should return:
+        [[0, 2.82],
+         [2.82, 0]]
+    :param A: m_a x n matrix
+    :param B: m_b x n matrix
+    :return: euclidean distance matrix (m_a x m_b)
+    """
+    # squared norms of each row in A and B
+    na = tf.reduce_sum(tf.square(A), 1)
+    nb = tf.reduce_sum(tf.square(B), 1)
+
+    # na as a row and nb as a co"lumn vectors
+    na = tf.reshape(na, [-1, 1])
+    nb = tf.reshape(nb, [1, -1])
+
+    # return pairwise euclidead difference matrix
+    D = tf.sqrt(tf.maximum(na - 2 * tf.matmul(A, B, False, True) + nb, 0.0))
+    return D
+
+
+def weighted_hausdorff_distance(w, h, alpha):
+    all_img_locations = tf.convert_to_tensor(cartesian([np.arange(w), np.arange(h)]), dtype=tf.float32)
+    max_dist = math.sqrt(w ** 2 + h ** 2)
+
+    def hausdorff_loss(y_true, y_pred):
+        def loss(y_true, y_pred):
+            eps = 1e-6
+            y_true = K.reshape(y_true, [w, h])
+            gt_points = K.cast(tf.where(y_true > 0.5), dtype=tf.float32)
+            num_gt_points = tf.shape(gt_points)[0]
+            y_pred = K.flatten(y_pred)
+            p = y_pred
+            p_replicated = tf.squeeze(K.repeat(tf.expand_dims(p, axis=-1), num_gt_points))
+            d_matrix = cdist(all_img_locations, gt_points)
+            num_est_pts = tf.reduce_sum(p)
+            term_1 = (1 / (num_est_pts + eps)) * K.sum(p * K.min(d_matrix, 1))
+
+            d_div_p = K.min((d_matrix + eps) / (p_replicated ** alpha + (eps / max_dist)), 0)
+            d_div_p = K.clip(d_div_p, 0, max_dist)
+            term_2 = K.mean(d_div_p, axis=0)
+
+            return term_1 + term_2
+
+        batched_losses = tf.map_fn(lambda x:
+                                   loss(x[0], x[1]),
+                                   (y_true, y_pred),
+                                   dtype=tf.float32)
+        return K.mean(tf.stack(batched_losses))
+
+    return hausdorff_loss
 
 
 class TrainingClass:
@@ -48,12 +154,10 @@ class TrainingClass:
         self.lrate = lrate
         self.reg = reg
         self.no_epochs = no_epochs
-        if(loss == "fancy"):
-            from fancyloss import lovasz_softmax_flat
-            self.loss = fancy_loss
-        elif(loss == "jaccard"):
-            from jaccard_loss import jaccard_distance
-            self.loss = jaccard_distance
+        if(loss == "dice"):
+            self.loss = dice_coef_loss
+        elif(loss == "hausdorff"):
+            self.loss = weighted_hausdorff_distance
         else:
             self.loss = loss
         self.load_data()
